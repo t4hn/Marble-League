@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+import {SPRINT_PHYSICS_CONFIG} from '../engine/sprintConfig';
 import {
   getSprintLaneCenterX,
   getSprintTrackSurfaceY,
@@ -32,6 +33,7 @@ const _camTargetPos = new THREE.Vector3();
 const _camLookTarget = new THREE.Vector3();
 const _curLookTarget = new THREE.Vector3(0, 1, 10);
 const _quatScratch = new THREE.Quaternion();
+const _prevQuatScratch = new THREE.Quaternion();
 const _dummyMat = new THREE.Matrix4();
 const _dummyPos = new THREE.Vector3();
 const _dummyQuat = new THREE.Quaternion();
@@ -264,30 +266,74 @@ export class SprintTrackScene {
     this.scene.add(spineMesh);
     this.disposables.push(spineGeo);
 
-    // 2. Side bumper rails + 7 inner lane dividers
-    const outerRailGeo = new THREE.BoxGeometry(0.16, 0.42, mainHyp + 0.3);
-    const outerRampRailGeo = new THREE.BoxGeometry(0.16, 0.42, rampHyp + 0.3);
-    const innerRailGeo = new THREE.BoxGeometry(0.05, 0.24, mainHyp + 0.3);
-    const innerRampRailGeo = new THREE.BoxGeometry(0.05, 0.24, rampHyp + 0.3);
-    this.disposables.push(outerRailGeo, outerRampRailGeo, innerRailGeo, innerRampRailGeo);
+    // 2. Full-length outer metal guard rails + launch-chute inner polycarbonate dividers
+    const chuteExt = SPRINT_PHYSICS_CONFIG.track.launchChuteExtensionMeters;
+    const chuteMainCenterZ = cfg.rampLengthMeters + chuteExt / 2;
+    const chuteMainHyp = chuteExt / Math.cos(mainRad);
+
+    const outerRailGeo = new THREE.BoxGeometry(0.16, 0.44, mainHyp + 0.3);
+    const outerRampRailGeo = new THREE.BoxGeometry(0.16, 0.44, rampHyp + 0.3);
+    const outerGlassGeo = new THREE.BoxGeometry(0.05, 0.36, mainHyp + 0.3);
+    const outerRampGlassGeo = new THREE.BoxGeometry(0.05, 0.36, rampHyp + 0.3);
+    const innerRampRailGeo = new THREE.BoxGeometry(0.05, 0.28, rampHyp + 0.1);
+    const innerChuteExtGeo = new THREE.BoxGeometry(0.05, 0.28, chuteMainHyp);
+    const endPostGeo = new THREE.CylinderGeometry(0.045, 0.045, 0.32, 10);
+    this.disposables.push(
+      outerRailGeo,
+      outerRampRailGeo,
+      outerGlassGeo,
+      outerRampGlassGeo,
+      innerRampRailGeo,
+      innerChuteExtGeo,
+      endPostGeo,
+    );
 
     for (let i = 0; i <= 8; i++) {
-      const dividerX = (i - 4) * cfg.laneWidthMeters;
       const isOuter = i === 0 || i === 8;
-      const mat = isOuter ? railMetalMat : dividerGlassMat;
-      const gMain = isOuter ? outerRailGeo : innerRailGeo;
-      const gRamp = isOuter ? outerRampRailGeo : innerRampRailGeo;
-      const hOffset = isOuter ? 0.19 : 0.1;
+      if (isOuter) {
+        const wallX = (i - 4) * cfg.laneWidthMeters + (i === 0 ? -0.04 : 0.04);
+        const mMain = new THREE.Mesh(outerRailGeo, railMetalMat);
+        mMain.position.set(wallX, getSprintTrackSurfaceY(mainCenterZ, cfg) + 0.18, mainCenterZ);
+        mMain.rotation.x = mainRad;
+        this.scene.add(mMain);
 
-      const mMain = new THREE.Mesh(gMain, mat);
-      mMain.position.set(dividerX, getSprintTrackSurfaceY(mainCenterZ, cfg) + hOffset, mainCenterZ);
-      mMain.rotation.x = mainRad;
-      this.scene.add(mMain);
+        const mRamp = new THREE.Mesh(outerRampRailGeo, railMetalMat);
+        mRamp.position.set(wallX, getSprintTrackSurfaceY(rampCenterZ, cfg) + 0.18, rampCenterZ);
+        mRamp.rotation.x = rampRad;
+        this.scene.add(mRamp);
 
-      const mRamp = new THREE.Mesh(gRamp, mat);
-      mRamp.position.set(dividerX, getSprintTrackSurfaceY(rampCenterZ, cfg) + hOffset, rampCenterZ);
-      mRamp.rotation.x = rampRad;
-      this.scene.add(mRamp);
+        const gMainGlass = new THREE.Mesh(outerGlassGeo, dividerGlassMat);
+        gMainGlass.position.set(wallX, getSprintTrackSurfaceY(mainCenterZ, cfg) + 0.56, mainCenterZ);
+        gMainGlass.rotation.x = mainRad;
+        this.scene.add(gMainGlass);
+
+        const gRampGlass = new THREE.Mesh(outerRampGlassGeo, dividerGlassMat);
+        gRampGlass.position.set(wallX, getSprintTrackSurfaceY(rampCenterZ, cfg) + 0.56, rampCenterZ);
+        gRampGlass.rotation.x = rampRad;
+        this.scene.add(gRampGlass);
+      } else {
+        const dividerX = (i - 4) * cfg.laneWidthMeters;
+        const mRamp = new THREE.Mesh(innerRampRailGeo, dividerGlassMat);
+        mRamp.position.set(dividerX, getSprintTrackSurfaceY(rampCenterZ, cfg) + 0.1, rampCenterZ);
+        mRamp.rotation.x = rampRad;
+        this.scene.add(mRamp);
+
+        if (chuteExt > 0.05) {
+          const mExt = new THREE.Mesh(innerChuteExtGeo, dividerGlassMat);
+          mExt.position.set(
+            dividerX,
+            getSprintTrackSurfaceY(chuteMainCenterZ, cfg) + 0.1,
+            chuteMainCenterZ,
+          );
+          mExt.rotation.x = mainRad;
+          this.scene.add(mExt);
+        }
+
+        const chuteEndZ = cfg.rampLengthMeters + chuteExt;
+        const post = new THREE.Mesh(endPostGeo, railMetalMat);
+        post.position.set(dividerX, getSprintTrackSurfaceY(chuteEndZ, cfg) + 0.14, chuteEndZ);
+        this.scene.add(post);
+      }
     }
 
     // 3. Checkered Finish Line strip offset +0.02m above deck
@@ -595,30 +641,58 @@ export class SprintTrackScene {
     racers: LiveMarbleState[],
     gateOpenProgress: number,
     dt: number,
+    prevRacers?: LiveMarbleState[],
+    alpha: number = 1,
   ): void {
     // Animate starting gate drop/lift bar
     this.gateBarGroup.position.y = this.gateClosedY + gateOpenProgress * 1.45;
 
+    const clampedAlpha = Math.max(0, Math.min(1, alpha));
     let leaderZ = 0;
     let packSumZ = 0;
     let activeCount = 0;
 
-    for (const r of racers) {
+    for (let i = 0; i < racers.length; i++) {
+      const r = racers[i];
       const rig = this.marbleRigs.get(r.marbleId);
       if (!rig) continue;
 
-      rig.group.position.set(r.position.x, r.position.y, r.position.z);
+      const prev =
+        prevRacers && prevRacers[i]?.marbleId === r.marbleId ? prevRacers[i] : undefined;
+
+      const px = prev
+        ? prev.position.x + (r.position.x - prev.position.x) * clampedAlpha
+        : r.position.x;
+      const py = prev
+        ? prev.position.y + (r.position.y - prev.position.y) * clampedAlpha
+        : r.position.y;
+      const pz = prev
+        ? prev.position.z + (r.position.z - prev.position.z) * clampedAlpha
+        : r.position.z;
+
+      rig.group.position.set(px, py, pz);
       _quatScratch.set(r.quaternion.x, r.quaternion.y, r.quaternion.z, r.quaternion.w);
-      rig.innerCore.quaternion.copy(_quatScratch);
-
-      const floorY = getSprintTrackSurfaceY(r.position.z, this.config);
-      rig.shadowDisc.position.set(r.position.x, floorY + 0.015, r.position.z);
-
-      if (!r.finished && r.position.z > leaderZ) {
-        leaderZ = r.position.z;
+      if (prev) {
+        _prevQuatScratch.set(
+          prev.quaternion.x,
+          prev.quaternion.y,
+          prev.quaternion.z,
+          prev.quaternion.w,
+        );
+        _prevQuatScratch.slerp(_quatScratch, clampedAlpha);
+        rig.innerCore.quaternion.copy(_prevQuatScratch);
+      } else {
+        rig.innerCore.quaternion.copy(_quatScratch);
       }
-      if (r.position.z <= this.config.trackLengthMeters + 4) {
-        packSumZ += r.position.z;
+
+      const floorY = getSprintTrackSurfaceY(pz, this.config);
+      rig.shadowDisc.position.set(px, floorY + 0.015, pz);
+
+      if (!r.finished && pz > leaderZ) {
+        leaderZ = pz;
+      }
+      if (pz <= this.config.trackLengthMeters + 4) {
+        packSumZ += pz;
         activeCount++;
       }
     }

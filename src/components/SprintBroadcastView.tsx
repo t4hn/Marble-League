@@ -105,12 +105,17 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
     document.body.dataset.state = mapped;
   }, [phase]);
 
+  const prevSnapRef = React.useRef<ReturnType<SprintSimulation['getSnapshot']> | null>(null);
+  const currSnapRef = React.useRef<ReturnType<SprintSimulation['getSnapshot']> | null>(null);
+
   const initializeSimulation = React.useCallback(
     (seed: number) => {
       const sim = new SprintSimulation(competitors, config, seed);
       simRef.current = sim;
       committedThisRunRef.current = false;
       const snap = sim.getSnapshot();
+      prevSnapRef.current = snap;
+      currSnapRef.current = snap;
       setLiveRacers(snap.racers);
       setElapsedSeconds(0);
       setCommentary([]);
@@ -159,7 +164,9 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
         const collectedCommentary: CommentaryLine[] = [];
 
         while (accumulator >= FIXED_PHYSICS_DT && substeps < maxSubsteps && !sim.isFinished()) {
+          prevSnapRef.current = currSnapRef.current;
           const events = sim.step(FIXED_PHYSICS_DT);
+          currSnapRef.current = sim.getSnapshot();
           accumulator -= FIXED_PHYSICS_DT;
           substeps++;
 
@@ -179,12 +186,24 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
           }
         }
 
+        // Prevent runaway accumulator backlog on severe tab stalls
+        if (substeps >= maxSubsteps && accumulator > FIXED_PHYSICS_DT) {
+          accumulator = FIXED_PHYSICS_DT * 0.5;
+        }
+
         if (collectedCommentary.length > 0) {
           setCommentary((prev) => [...prev, ...collectedCommentary].slice(-8));
         }
 
-        const snap = sim.getSnapshot();
-        scene.syncFromSimulation(snap.racers, snap.gateOpenProgress, dt);
+        const snap = currSnapRef.current ?? sim.getSnapshot();
+        const alpha = sim.isFinished() ? 1 : accumulator / FIXED_PHYSICS_DT;
+        scene.syncFromSimulation(
+          snap.racers,
+          snap.gateOpenProgress,
+          dt,
+          prevSnapRef.current?.racers,
+          alpha,
+        );
 
         const activeRacers = snap.racers.filter((r) => !r.finished);
         const avgSpeed =
@@ -235,7 +254,10 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
           onCommitRef.current(resultPayload);
         }
       } else if (sim) {
+        accumulator = 0;
         const snap = sim.getSnapshot();
+        currSnapRef.current = snap;
+        prevSnapRef.current = snap;
         scene.syncFromSimulation(snap.racers, snap.gateOpenProgress, dt);
         audio.updateRollingBed(false, 0);
       }

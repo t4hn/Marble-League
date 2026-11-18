@@ -45,8 +45,17 @@ export function buildCommentaryForEvent(
       return {
         id: evt.id,
         elapsedSeconds: evt.elapsedSeconds,
-        text: `Clean move in lane traffic: ${primary.name} passes ${secondary.name} for P${evt.position}.`,
+        text: `Clean move in open traffic: ${primary.name} passes ${secondary.name} for P${evt.position}.`,
         emphasis: 'normal',
+      };
+
+    case 'MARBLE_CONTACT':
+      if (!primary || !secondary) return null;
+      return {
+        id: evt.id,
+        elapsedSeconds: evt.elapsedSeconds,
+        text: `Wheel-to-wheel contact at ${Math.round(evt.distanceMeters)}m as ${primary.name} and ${secondary.name} trade momentum in the pack!`,
+        emphasis: 'highlight',
       };
 
     case 'CLOSE_CONTEST':

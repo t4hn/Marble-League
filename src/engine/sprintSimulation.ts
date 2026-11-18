@@ -1,14 +1,16 @@
 import * as CANNON from 'cannon-es';
 import {Marble, SprintLayoutConfig, Team} from '../types/league';
 import {createSeededRng} from './prng';
+import {SPRINT_PHYSICS_CONFIG, SprintPhysicsConfig} from './sprintConfig';
 
-export const MARBLE_RADIUS = 0.24;
-export const FIXED_PHYSICS_DT = 1 / 120;
+export const MARBLE_RADIUS = SPRINT_PHYSICS_CONFIG.marbleRadius;
+export const FIXED_PHYSICS_DT = SPRINT_PHYSICS_CONFIG.fixedDt;
 
 export type SimulationEventType =
   | 'RACE_START'
   | 'LEAD_CHANGE'
   | 'OVERTAKE'
+  | 'MARBLE_CONTACT'
   | 'CLOSE_CONTEST'
   | 'FALLING_BEHIND'
   | 'MARBLE_FINISH'
@@ -53,6 +55,20 @@ export interface SprintCompetitorInput {
   lane: number; // 1..8
 }
 
+export interface SprintTelemetry {
+  marbleCollisions: number;
+  significantCollisions: number;
+  avgCollisionImpactSpeed: number;
+  maxCollisionImpactSpeed: number;
+  wallContacts: number;
+  overtakes: number;
+  leadChanges: number;
+  collisionLinkedPositionChanges: number;
+  closePackSeconds: number;
+  stuckCount: number;
+  escapedCount: number;
+}
+
 interface SeamImpulse {
   z: number;
   lateralImpulse: number;
@@ -63,15 +79,18 @@ interface SeamImpulse {
 interface InternalRacer {
   input: SprintCompetitorInput;
   body: CANNON.Body;
-  vMax: number;
-  accelMultiplier: number;
-  handlingFactor: number;
-  stabilityFactor: number;
+  accelOffset: number;
+  topSpeedOffset: number;
+  handlingOffset: number;
+  stabilityOffset: number;
   laneCenterX: number;
+  gustPhase: number;
+  gustFreq: number;
   topSpeedReached: number;
   finished: boolean;
   finishTimeSeconds: number | null;
   prevZ: number;
+  lastContactTime: number;
   seams: SeamImpulse[];
 }
 
@@ -110,8 +129,12 @@ export function getSprintLaneCenterX(lane: number, laneWidth: number): number {
 export class SprintSimulation {
   public readonly seed: number;
   public readonly config: SprintLayoutConfig;
+  public readonly physicsConfig: SprintPhysicsConfig;
+
   private readonly world: CANNON.World;
   private readonly racers: InternalRacer[] = [];
+  private readonly racerByBodyId = new Map<number, InternalRacer>();
+  private readonly railBodyIds = new Set<number>();
   private readonly events: SimulationEvent[] = [];
   private readonly rng: () => number;
 
@@ -121,24 +144,52 @@ export class SprintSimulation {
   private gateOpenProgress = 0;
   private gateDropBody: CANNON.Body;
 
-  // Event tracking state
+  // Pre-allocated scratch buffers to avoid per-tick GC allocations
+  private readonly _forceVec = new CANNON.Vec3();
+  private readonly _impulseVec = new CANNON.Vec3();
+  private readonly _orderedScratch: InternalRacer[] = [];
+  private readonly _orderIdsScratch: string[] = [];
+
+  // Race dynamics & commentary rate-limiting
   private currentLeaderId: string | null = null;
   private prevOrderIds: string[] = [];
   private lastOvertakeEventTime = -10;
+  private lastContactEventTime = -10;
   private lastCloseContestTime = -10;
   private lastFallingBehindTime = -10;
   private eventSeq = 0;
 
-  constructor(competitors: SprintCompetitorInput[], config: SprintLayoutConfig, seed: number) {
+  // Collision & overtaking instrumentation
+  private marbleCollisions = 0;
+  private significantCollisions = 0;
+  private impactSpeedSum = 0;
+  private maxImpactSpeed = 0;
+  private wallContacts = 0;
+  private overtakeCount = 0;
+  private leadChangeCount = 0;
+  private collisionLinkedPositionChanges = 0;
+  private closePackTicks = 0;
+  private readonly pairLastContactTime = new Map<string, number>();
+
+  constructor(
+    competitors: SprintCompetitorInput[],
+    config: SprintLayoutConfig,
+    seed: number,
+    physicsConfig: SprintPhysicsConfig = SPRINT_PHYSICS_CONFIG,
+  ) {
     this.seed = seed;
     this.config = config;
+    this.physicsConfig = physicsConfig;
     this.rng = createSeededRng(seed);
 
     this.world = new CANNON.World({
-      gravity: new CANNON.Vec3(0, -9.81, 0),
+      gravity: new CANNON.Vec3(0, physicsConfig.gravityY, 0),
     });
-    this.world.broadphase = new CANNON.SAPBroadphase(this.world);
-    (this.world.solver as CANNON.GSSolver).iterations = 8;
+    // Sort broadphase along Z (the race track axis) for minimal pair checks
+    const sap = new CANNON.SAPBroadphase(this.world);
+    sap.axisIndex = 2;
+    this.world.broadphase = sap;
+    (this.world.solver as CANNON.GSSolver).iterations = physicsConfig.solverIterations;
 
     const trackMat = new CANNON.Material('track');
     const railMat = new CANNON.Material('rail');
@@ -146,50 +197,49 @@ export class SprintSimulation {
 
     this.world.addContactMaterial(
       new CANNON.ContactMaterial(marbleMat, trackMat, {
-        friction: 0.035,
-        restitution: 0.12,
+        friction: physicsConfig.materials.marbleTrack.friction,
+        restitution: physicsConfig.materials.marbleTrack.restitution,
       }),
     );
     this.world.addContactMaterial(
       new CANNON.ContactMaterial(marbleMat, railMat, {
-        friction: 0.06,
-        restitution: 0.35,
+        friction: physicsConfig.materials.marbleRail.friction,
+        restitution: physicsConfig.materials.marbleRail.restitution,
       }),
     );
     this.world.addContactMaterial(
       new CANNON.ContactMaterial(marbleMat, marbleMat, {
-        friction: 0.05,
-        restitution: 0.72,
+        friction: physicsConfig.materials.marbleMarble.friction,
+        restitution: physicsConfig.materials.marbleMarble.restitution,
       }),
     );
 
     const totalWidth = config.laneWidthMeters * 8 + 0.6;
     const rampRad = (config.rampSlopeDegrees * Math.PI) / 180;
     const mainRad = (config.mainSlopeDegrees * Math.PI) / 180;
+    const deckThickness = 0.6;
 
     // 1. Sloped launch ramp floor (-3m behind start gate to rampLengthMeters)
     const rampSpan = config.rampLengthMeters + 3.0;
     const rampHyp = rampSpan / Math.cos(rampRad);
-    const rampThickness = 0.6;
     const rampCenterZ = (config.rampLengthMeters - 3.0) / 2;
     const rampCenterY =
-      getSprintTrackSurfaceY(rampCenterZ, config) -
-      (rampThickness / 2) * Math.cos(rampRad);
+      getSprintTrackSurfaceY(rampCenterZ, config) - (deckThickness / 2) * Math.cos(rampRad);
     const rampBody = new CANNON.Body({mass: 0, material: trackMat});
     rampBody.addShape(
-      new CANNON.Box(new CANNON.Vec3(totalWidth / 2, rampThickness / 2, rampHyp / 2 + 0.15)),
+      new CANNON.Box(new CANNON.Vec3(totalWidth / 2, deckThickness / 2, rampHyp / 2)),
     );
     rampBody.position.set(0, rampCenterY, rampCenterZ);
     rampBody.quaternion.setFromEuler(rampRad, 0, 0);
     this.world.addBody(rampBody);
 
-    // 2. Smooth bevel transition wedge at z = rampLengthMeters so marbles never hop
+    // 2. Flush bevel transition slab bridging ramp slope to main straightaway slope
     const transRad = (rampRad + mainRad) / 2;
     const transBody = new CANNON.Body({mass: 0, material: trackMat});
-    transBody.addShape(new CANNON.Box(new CANNON.Vec3(totalWidth / 2, 0.3, 0.55)));
+    transBody.addShape(new CANNON.Box(new CANNON.Vec3(totalWidth / 2, 0.3, 0.45)));
     transBody.position.set(
       0,
-      getSprintTrackSurfaceY(config.rampLengthMeters, config) - 0.3 * Math.cos(transRad) - 0.015,
+      getSprintTrackSurfaceY(config.rampLengthMeters, config) - 0.3 * Math.cos(transRad) - 0.012,
       config.rampLengthMeters,
     );
     transBody.quaternion.setFromEuler(transRad, 0, 0);
@@ -201,46 +251,97 @@ export class SprintSimulation {
     const mainHyp = mainSpan / Math.cos(mainRad);
     const mainCenterZ = config.rampLengthMeters + mainSpan / 2;
     const mainCenterY =
-      getSprintTrackSurfaceY(mainCenterZ, config) -
-      (rampThickness / 2) * Math.cos(mainRad);
+      getSprintTrackSurfaceY(mainCenterZ, config) - (deckThickness / 2) * Math.cos(mainRad);
     const mainBody = new CANNON.Body({mass: 0, material: trackMat});
     mainBody.addShape(
-      new CANNON.Box(new CANNON.Vec3(totalWidth / 2, rampThickness / 2, mainHyp / 2 + 0.15)),
+      new CANNON.Box(new CANNON.Vec3(totalWidth / 2, deckThickness / 2, mainHyp / 2)),
     );
     mainBody.position.set(0, mainCenterY, mainCenterZ);
     mainBody.quaternion.setFromEuler(mainRad, 0, 0);
     this.world.addBody(mainBody);
 
-    // 4. Lane divider rails (9 dividers forming 8 straight-line lanes)
-    const wallHeight = 0.34;
-    const wallHalfThick = 0.04;
-    for (let i = 0; i <= 8; i++) {
-      const dividerX = (i - 4) * config.laneWidthMeters;
-      // Ramp section rail
-      const rampRail = new CANNON.Body({mass: 0, material: railMat});
-      rampRail.addShape(
-        new CANNON.Box(new CANNON.Vec3(wallHalfThick, wallHeight / 2, rampHyp / 2 + 0.1)),
+    // 4a. Full-length outer containment guard walls (i = 0 and i = 8)
+    const outerHalfThick = 0.08;
+    const outerHeight = physicsConfig.track.outerWallHeight;
+    for (const i of [0, 8]) {
+      const wallX = (i - 4) * config.laneWidthMeters + (i === 0 ? -0.04 : 0.04);
+
+      const outerRampWall = new CANNON.Body({mass: 0, material: railMat});
+      outerRampWall.addShape(
+        new CANNON.Box(new CANNON.Vec3(outerHalfThick, outerHeight / 2, rampHyp / 2 + 0.25)),
       );
-      rampRail.position.set(
-        dividerX,
-        getSprintTrackSurfaceY(rampCenterZ, config) + wallHeight / 2 - 0.04,
+      outerRampWall.position.set(
+        wallX,
+        getSprintTrackSurfaceY(rampCenterZ, config) + outerHeight / 2 - 0.05,
         rampCenterZ,
       );
-      rampRail.quaternion.setFromEuler(rampRad, 0, 0);
-      this.world.addBody(rampRail);
+      outerRampWall.quaternion.setFromEuler(rampRad, 0, 0);
+      this.world.addBody(outerRampWall);
+      this.railBodyIds.add(outerRampWall.id);
 
-      // Main section rail
-      const mainRail = new CANNON.Body({mass: 0, material: railMat});
-      mainRail.addShape(
-        new CANNON.Box(new CANNON.Vec3(wallHalfThick, wallHeight / 2, mainHyp / 2 + 0.1)),
+      const outerMainWall = new CANNON.Body({mass: 0, material: railMat});
+      outerMainWall.addShape(
+        new CANNON.Box(new CANNON.Vec3(outerHalfThick, outerHeight / 2, mainHyp / 2 + 0.25)),
       );
-      mainRail.position.set(
-        dividerX,
-        getSprintTrackSurfaceY(mainCenterZ, config) + wallHeight / 2 - 0.04,
+      outerMainWall.position.set(
+        wallX,
+        getSprintTrackSurfaceY(mainCenterZ, config) + outerHeight / 2 - 0.05,
         mainCenterZ,
       );
-      mainRail.quaternion.setFromEuler(mainRad, 0, 0);
-      this.world.addBody(mainRail);
+      outerMainWall.quaternion.setFromEuler(mainRad, 0, 0);
+      this.world.addBody(outerMainWall);
+      this.railBodyIds.add(outerMainWall.id);
+    }
+
+    // 4b. Inner polycarbonate launch-chute dividers (i = 1..7) ending cleanly with rounded stanchions
+    const innerHalfThick = 0.025;
+    const innerHeight = physicsConfig.track.innerDividerHeight;
+    const chuteExt = physicsConfig.track.launchChuteExtensionMeters;
+    const chuteMainCenterZ = config.rampLengthMeters + chuteExt / 2;
+    const chuteMainHyp = chuteExt / Math.cos(mainRad);
+    const chuteEndZ = config.rampLengthMeters + chuteExt;
+    const stanchionRadius = 0.045;
+
+    for (let i = 1; i <= 7; i++) {
+      const dividerX = (i - 4) * config.laneWidthMeters;
+
+      const chuteRampRail = new CANNON.Body({mass: 0, material: railMat});
+      chuteRampRail.addShape(
+        new CANNON.Box(new CANNON.Vec3(innerHalfThick, innerHeight / 2, rampHyp / 2 + 0.05)),
+      );
+      chuteRampRail.position.set(
+        dividerX,
+        getSprintTrackSurfaceY(rampCenterZ, config) + innerHeight / 2 - 0.04,
+        rampCenterZ,
+      );
+      chuteRampRail.quaternion.setFromEuler(rampRad, 0, 0);
+      this.world.addBody(chuteRampRail);
+      this.railBodyIds.add(chuteRampRail.id);
+
+      if (chuteExt > 0.05) {
+        const chuteExtRail = new CANNON.Body({mass: 0, material: railMat});
+        chuteExtRail.addShape(
+          new CANNON.Box(new CANNON.Vec3(innerHalfThick, innerHeight / 2, chuteMainHyp / 2)),
+        );
+        chuteExtRail.position.set(
+          dividerX,
+          getSprintTrackSurfaceY(chuteMainCenterZ, config) + innerHeight / 2 - 0.04,
+          chuteMainCenterZ,
+        );
+        chuteExtRail.quaternion.setFromEuler(mainRad, 0, 0);
+        this.world.addBody(chuteExtRail);
+        this.railBodyIds.add(chuteExtRail.id);
+      }
+
+      const postBody = new CANNON.Body({mass: 0, material: railMat});
+      postBody.addShape(new CANNON.Cylinder(stanchionRadius, stanchionRadius, innerHeight + 0.04, 8));
+      postBody.position.set(
+        dividerX,
+        getSprintTrackSurfaceY(chuteEndZ, config) + innerHeight / 2 - 0.02,
+        chuteEndZ,
+      );
+      this.world.addBody(postBody);
+      this.railBodyIds.add(postBody.id);
     }
 
     // 5. Mechanical starting gate barrier at z = 0.32 (lifted cleanly when race starts)
@@ -263,60 +364,122 @@ export class SprintSimulation {
     for (const comp of competitors) {
       const laneCenterX = getSprintLaneCenterX(comp.lane, config.laneWidthMeters);
       const startZ = -0.3;
-      const startY = getSprintTrackSurfaceY(startZ, config) + MARBLE_RADIUS + 0.005;
+      const startY =
+        getSprintTrackSurfaceY(startZ, config) + physicsConfig.marbleRadius + 0.004;
 
       const body = new CANNON.Body({
-        mass: 1.0,
+        mass: physicsConfig.marbleMass,
         material: marbleMat,
-        linearDamping: 0.02,
-        angularDamping: 0.04,
+        linearDamping: physicsConfig.damping.linear,
+        angularDamping: physicsConfig.damping.angular,
       });
-      body.addShape(new CANNON.Sphere(MARBLE_RADIUS));
+      body.addShape(new CANNON.Sphere(physicsConfig.marbleRadius));
       body.position.set(laneCenterX, startY, startZ);
 
       const {acceleration, topSpeed, handling, stability} = comp.marble.attributes;
 
-      // Calibrated attribute-to-physics mappings
-      // Top Speed 52..92 -> 10.6 .. 12.8 m/s
-      const vMax = 11.6 + (topSpeed - 70) * 0.055;
-      // Acceleration 52..92 -> 0.82 .. 1.24 drive response
-      const accelMultiplier = 1.0 + (acceleration - 70) * 0.0095;
-      // Handling 52..92 -> lane centering precision
-      const handlingFactor = 0.65 + (handling - 70) * 0.012;
-      // Stability 52..92 -> resistance to track seam disruption
-      const stabilityFactor = Math.max(0.25, (116 - stability) / 46);
-
-      // Generate deterministic track seam perturbations along this lane
+      // Generate deterministic track seam perturbations along this lane corridor
       const seams: SeamImpulse[] = [];
       const spacing = (config.trackLengthMeters - 10) / Math.max(1, config.seamCount);
       for (let s = 0; s < config.seamCount; s++) {
-        const zPos = 8 + s * spacing + (this.rng() - 0.5) * 2.2;
+        const zPos = 8 + s * spacing + (this.rng() - 0.5) * 2.4;
         const lateralDir = this.rng() < 0.5 ? -1 : 1;
-        const mag = (0.35 + this.rng() * 0.65) * config.surfaceRoughness;
+        const mag = (0.35 + this.rng() * 0.75) * config.surfaceRoughness;
         seams.push({
           z: zPos,
-          lateralImpulse: lateralDir * mag * 0.9,
-          dragImpulse: mag * 0.55,
+          lateralImpulse: lateralDir * mag * physicsConfig.variance.seamLateralScale,
+          dragImpulse: mag * physicsConfig.variance.seamDragScale,
           triggered: false,
         });
       }
 
-      this.world.addBody(body);
-      this.racers.push({
+      const racer: InternalRacer = {
         input: comp,
         body,
-        vMax,
-        accelMultiplier,
-        handlingFactor,
-        stabilityFactor,
+        accelOffset: acceleration - 70,
+        topSpeedOffset: topSpeed - 70,
+        handlingOffset: handling - 70,
+        stabilityOffset: stability - 70,
         laneCenterX,
+        gustPhase: this.rng() * Math.PI * 2,
+        gustFreq: 0.75 + this.rng() * 0.85,
         topSpeedReached: 0,
         finished: false,
         finishTimeSeconds: null,
         prevZ: startZ,
+        lastContactTime: -10,
         seams,
-      });
+      };
+
+      this.world.addBody(body);
+      this.racerByBodyId.set(body.id, racer);
+      this.racers.push(racer);
+      this._orderedScratch.push(racer);
+      this._orderIdsScratch.push(comp.marble.id);
     }
+
+    this.attachContactListener();
+  }
+
+  private attachContactListener(): void {
+    this.world.addEventListener(
+      'beginContact',
+      (event: {bodyA: CANNON.Body; bodyB: CANNON.Body}) => {
+        if (!this.started || this.finished) return;
+        const rA = this.racerByBodyId.get(event.bodyA.id);
+        const rB = this.racerByBodyId.get(event.bodyB.id);
+
+        if (rA && rB) {
+          if (rA.finished || rB.finished) return;
+          const pairKey =
+            rA.body.id < rB.body.id
+              ? `${rA.body.id}|${rB.body.id}`
+              : `${rB.body.id}|${rA.body.id}`;
+          const lastPairTime = this.pairLastContactTime.get(pairKey) ?? -10;
+          if (this.elapsedSeconds - lastPairTime < 0.14) return;
+          this.pairLastContactTime.set(pairKey, this.elapsedSeconds);
+
+          const dvx = rA.body.velocity.x - rB.body.velocity.x;
+          const dvy = rA.body.velocity.y - rB.body.velocity.y;
+          const dvz = rA.body.velocity.z - rB.body.velocity.z;
+          const impactSpeed = Math.hypot(dvx, dvy, dvz);
+
+          this.marbleCollisions += 1;
+          this.impactSpeedSum += impactSpeed;
+          if (impactSpeed > this.maxImpactSpeed) {
+            this.maxImpactSpeed = impactSpeed;
+          }
+
+          rA.lastContactTime = this.elapsedSeconds;
+          rB.lastContactTime = this.elapsedSeconds;
+
+          if (impactSpeed >= this.physicsConfig.telemetry.significantImpactSpeed) {
+            this.significantCollisions += 1;
+            if (this.elapsedSeconds - this.lastContactEventTime > 2.2) {
+              this.lastContactEventTime = this.elapsedSeconds;
+              const leadRacer = rA.body.position.z >= rB.body.position.z ? rA : rB;
+              const trailRacer = leadRacer === rA ? rB : rA;
+              this.pushEvent({
+                type: 'MARBLE_CONTACT',
+                elapsedSeconds: this.elapsedSeconds,
+                distanceMeters: (rA.body.position.z + rB.body.position.z) * 0.5,
+                primaryMarbleId: leadRacer.input.marble.id,
+                secondaryMarbleId: trailRacer.input.marble.id,
+                speed: impactSpeed,
+              });
+            }
+          }
+          return;
+        }
+
+        // Track rail contact counts for diagnostics
+        if (rA && this.railBodyIds.has(event.bodyB.id) && !rA.finished) {
+          this.wallContacts += 1;
+        } else if (rB && this.railBodyIds.has(event.bodyA.id) && !rB.finished) {
+          this.wallContacts += 1;
+        }
+      },
+    );
   }
 
   public startRace(): void {
@@ -325,11 +488,18 @@ export class SprintSimulation {
     this.gateDropBody.position.y += 4.0;
     this.gateDropBody.collisionResponse = false;
 
-    // Simultaneous launch micro-impulse (tiny 1% seeded variation at gate drop)
+    const p = this.physicsConfig.propulsion;
+    const a = this.physicsConfig.attributes;
+    const R = this.physicsConfig.marbleRadius;
+
+    // Seeded starting-gate release impulse (scaled by Acceleration + realistic gate variance)
     for (const r of this.racers) {
-      const gateSnap = (0.985 + this.rng() * 0.03) * r.accelMultiplier;
-      r.body.velocity.z = 1.35 * gateSnap;
-      r.body.angularVelocity.x = r.body.velocity.z / MARBLE_RADIUS;
+      const accelMod = 1 + r.accelOffset * a.accelSensitivity;
+      const jitter = 1 + (this.rng() * 2 - 1) * p.gateJitterFraction;
+      const launchSpeed = p.baseGateSpeed * accelMod * jitter;
+      r.body.applyImpulse(new CANNON.Vec3(0, 0, launchSpeed * this.physicsConfig.marbleMass));
+      // Matching initial spin impulse for clean immediate launch roll
+      r.body.angularVelocity.x = launchSpeed / R;
     }
 
     this.pushEvent({
@@ -347,76 +517,139 @@ export class SprintSimulation {
     this.elapsedSeconds += fixedDt;
     this.gateOpenProgress = Math.min(1, this.gateOpenProgress + fixedDt * 5.0);
 
-    for (const r of this.racers) {
-      const vz = r.body.velocity.z;
+    const pc = this.physicsConfig;
+    const chuteEndZ = this.config.rampLengthMeters + pc.track.launchChuteExtensionMeters;
+    const outerHalfWidth = this.config.laneWidthMeters * 4;
+
+    for (let i = 0; i < this.racers.length; i++) {
+      const r = this.racers[i];
       const vx = r.body.velocity.x;
+      const vz = r.body.velocity.z;
+      const x = r.body.position.x;
       const z = r.body.position.z;
 
       if (!r.finished) {
-        // 1. Rolling drive force scaled by Acceleration & remaining headroom to Top Speed
-        const speedRatio = Math.max(0, vz / r.vMax);
-        const driveHeadroom = Math.max(0, 1 - speedRatio * speedRatio);
-        // Stronger drive on ramp/launch, tapering smoothly near vMax
-        const onRamp = z < this.config.rampLengthMeters;
-        const baseDrive = onRamp ? 6.8 : 4.6;
-        const driveForceZ = baseDrive * r.accelMultiplier * (0.22 + 0.78 * driveHeadroom);
-        r.body.applyForce(new CANNON.Vec3(0, 0, driveForceZ));
+        const accelFactor = 1 + r.accelOffset * pc.attributes.accelSensitivity;
+        const aeroFactor = Math.max(0.7, 1 - r.topSpeedOffset * pc.attributes.topSpeedAeroSensitivity);
+        const handlingFactor = 1 + r.handlingOffset * pc.attributes.handlingSensitivity;
+        const stabilityFactor = Math.max(0.68, 1 - r.stabilityOffset * pc.attributes.stabilitySensitivity);
 
-        // 2. Aerodynamic drag enforcing Top Speed ceiling naturally
-        if (vz > r.vMax * 0.85) {
-          const excess = Math.max(0, vz - r.vMax * 0.85);
-          const dragZ = -(excess * 1.45 + Math.max(0, vz - r.vMax) * 6.5);
-          r.body.applyForce(new CANNON.Vec3(0, 0, dragZ));
+        // 1. Continuous forward rolling drive (gravity assists strongly on ramp; drive sustains straightaway)
+        const inRampZone = z < this.config.rampLengthMeters + 2.5;
+        const baseDrive = inRampZone ? pc.propulsion.rampDriveForce : pc.propulsion.mainDriveForce;
+        // Acceleration helps strongly on launch & ramp, tapering down once at full straightaway speed
+        const accelWeight = inRampZone ? 1.0 : 0.25;
+        const effectiveDrive = baseDrive * (1 + (accelFactor - 1) * accelWeight);
+
+        // 2. Slipstream drafting behind a leading marble on the open straightaway
+        let dragReduction = 0;
+        let draftPullX = 0;
+        if (z > chuteEndZ) {
+          for (let j = 0; j < this.racers.length; j++) {
+            if (i === j) continue;
+            const ahead = this.racers[j];
+            if (ahead.finished) continue;
+            const dz = ahead.body.position.z - z;
+            if (dz >= pc.drafting.minGapMeters && dz <= pc.drafting.maxGapMeters) {
+              const dx = ahead.body.position.x - x;
+              const absDx = Math.abs(dx);
+              if (absDx <= pc.drafting.maxLateralOffsetMeters) {
+                const distFactor =
+                  1 - (dz - pc.drafting.minGapMeters) / (pc.drafting.maxGapMeters - pc.drafting.minGapMeters);
+                const alignFactor = 1 - absDx / pc.drafting.maxLateralOffsetMeters;
+                const candidateReduction = pc.drafting.maxDragReduction * distFactor * alignFactor;
+                if (candidateReduction > dragReduction) {
+                  dragReduction = candidateReduction;
+                }
+                // Agile (high-HND) marbles subtly tuck into or peek out of the wake
+                if (absDx > 0.12) {
+                  draftPullX +=
+                    Math.sign(dx) * pc.drafting.slipstreamPullForce * handlingFactor * distFactor;
+                }
+              }
+            }
+          }
         }
 
-        // 3. Handling: lateral lane-centering & rail-skim energy preservation
-        const lateralOffset = r.body.position.x - r.laneCenterX;
-        const centeringForceX =
-          -lateralOffset * (6.5 * r.handlingFactor) - vx * (2.2 * r.handlingFactor);
-        r.body.applyForce(new CANNON.Vec3(centeringForceX, 0, 0));
+        // 3. Quadratic aerodynamic drag + linear rolling resistance (reduced by Handling)
+        const speedZ = Math.max(0, vz);
+        const aeroDrag =
+          pc.propulsion.aeroDragCoeff * aeroFactor * (1 - dragReduction) * speedZ * speedZ;
+        const rollingDrag =
+          (pc.propulsion.rollingResistance / Math.max(0.7, handlingFactor)) * speedZ;
 
-        // Slight energy bleed if marble drifts far enough to skim lane divider
-        const halfLaneLimit = this.config.laneWidthMeters * 0.5 - MARBLE_RADIUS - 0.05;
-        if (Math.abs(lateralOffset) > halfLaneLimit) {
-          const skimPenalty = (1.35 - r.handlingFactor * 0.45) * 1.8;
-          r.body.applyForce(new CANNON.Vec3(0, 0, -Math.max(0.2, skimPenalty)));
+        // Lateral velocity scrubbing & high-speed surface chatter (mitigated by Handling & Stability)
+        const lateralScrub = (Math.abs(vx) * 0.34) / Math.max(0.7, handlingFactor);
+        const surfaceChatter =
+          (0.08 * this.config.surfaceRoughness * stabilityFactor * speedZ) / 10;
+
+        // Deterministic micro-turbulence gusts (mitigated by Stability)
+        const gustForceZ =
+          Math.sin(z * 0.24 + this.elapsedSeconds * r.gustFreq + r.gustPhase) *
+          pc.variance.gustForceAmplitude *
+          stabilityFactor;
+
+        const netForceZ =
+          effectiveDrive + gustForceZ - aeroDrag - rollingDrag - lateralScrub - surfaceChatter;
+
+        // 4. Soft lane guidance (stronger inside launch chute, very gentle on open straightaway)
+        const inChute = z <= chuteEndZ;
+        const lateralOffset = x - r.laneCenterX;
+        let forceX = draftPullX;
+        if (inChute) {
+          forceX +=
+            -lateralOffset * pc.laneGuidance.chuteSpringK * handlingFactor -
+            vx * pc.laneGuidance.chuteDamping;
+        } else {
+          // Subtle lane affinity + outer guard-wall air cushion so marbles stay active in the pack
+          forceX +=
+            -lateralOffset * pc.laneGuidance.openSpringK * handlingFactor -
+            vx * pc.laneGuidance.openDamping;
+          const distToWall = outerHalfWidth - Math.abs(x);
+          if (distToWall < pc.laneGuidance.wallBufferMeters) {
+            const wallDepth = pc.laneGuidance.wallBufferMeters - distToWall;
+            forceX += -Math.sign(x) * wallDepth * pc.laneGuidance.wallRepelForce * handlingFactor;
+          }
         }
 
-        // 4. Stability: deterministic track joint seam micro-perturbations
+        // Damp anomalous upward pinch bounces so pinched marbles stay grounded on the deck
+        const forceY = r.body.velocity.y > 0.65 ? -r.body.velocity.y * 5.0 : 0;
+        this._forceVec.set(forceX, forceY, netForceZ);
+        r.body.applyForce(this._forceVec);
+
+        // 5. Track seam perturbations via physical impulses (no direct velocity overwriting)
         for (const seam of r.seams) {
           if (!seam.triggered && z >= seam.z) {
             seam.triggered = true;
-            const disrupt = r.stabilityFactor;
-            // Lateral wobble inversely scaled by Stability & Handling
-            const latImpulse = (seam.lateralImpulse * disrupt) / (0.8 + r.handlingFactor * 0.3);
-            const slowImpulse = -seam.dragImpulse * disrupt * (1.15 - r.accelMultiplier * 0.15);
-            r.body.velocity.x += latImpulse;
-            r.body.velocity.z = Math.max(2.0, r.body.velocity.z + slowImpulse);
+            const latImpulse =
+              (seam.lateralImpulse * stabilityFactor) / (0.85 + 0.15 * handlingFactor);
+            const dragImpulse =
+              -seam.dragImpulse * stabilityFactor * (1.08 - 0.08 * accelFactor);
+            // Cap drag impulse so a marble can never stall below minimum forward flow
+            const safeDrag = Math.max(dragImpulse, -(Math.max(0, vz - 3.5)) * 0.5);
+            this._impulseVec.set(latImpulse, 0, safeDrag);
+            r.body.applyImpulse(this._impulseVec);
           }
         }
       } else {
         // Post-finish smooth coasting deceleration in catch basin
-        r.body.applyForce(new CANNON.Vec3(-vx * 2.5, 0, -vz * 1.8));
-      }
-
-      // Sync rolling spin feel if lateral contacts slightly twist velocity
-      if (vz > 0.2) {
-        r.body.angularVelocity.x = vz / MARBLE_RADIUS;
+        this._forceVec.set(-vx * 2.5, 0, -vz * 1.8);
+        r.body.applyForce(this._forceVec);
       }
     }
 
     this.world.step(fixedDt);
 
-    // Post-step checks: top speed, finish line crossings, live order events
+    // Post-step checks: top speed, finish line crossings, close-pack metric, race dynamics
     let allFinished = true;
-    for (const r of this.racers) {
+    for (let i = 0; i < this.racers.length; i++) {
+      const r = this.racers[i];
       const z = r.body.position.z;
       const speed = Math.hypot(r.body.velocity.x, r.body.velocity.y, r.body.velocity.z);
       if (speed > r.topSpeedReached && !r.finished) {
         r.topSpeedReached = speed;
       }
 
-      // Finish line crossing with sub-tick linear interpolation
       if (!r.finished && z >= this.config.trackLengthMeters) {
         const dz = Math.max(1e-6, z - r.prevZ);
         const frac = Math.max(0, Math.min(1, (this.config.trackLengthMeters - r.prevZ) / dz));
@@ -437,6 +670,13 @@ export class SprintSimulation {
 
       if (!r.finished) {
         allFinished = false;
+        // Close-pack separation check against active competitors
+        for (let j = i + 1; j < this.racers.length; j++) {
+          const other = this.racers[j];
+          if (!other.finished && Math.abs(z - other.body.position.z) <= pc.telemetry.closePackMeters) {
+            this.closePackTicks += 1;
+          }
+        }
       }
       r.prevZ = z;
     }
@@ -467,9 +707,10 @@ export class SprintSimulation {
     const last = ordered[ordered.length - 1];
     const orderIds = ordered.map((r) => r.input.marble.id);
 
-    // Lead change detection (only after 4m so start scatter isn't noisy)
+    // Lead change detection (only after 4m so launch settle isn't noisy)
     if (leader.body.position.z > 4 && !leader.finished) {
       if (this.currentLeaderId && this.currentLeaderId !== leader.input.marble.id) {
+        this.leadChangeCount += 1;
         this.pushEvent({
           type: 'LEAD_CHANGE',
           elapsedSeconds: this.elapsedSeconds,
@@ -482,30 +723,42 @@ export class SprintSimulation {
       this.currentLeaderId = leader.input.marble.id;
     }
 
-    // Mid-pack overtakes (rate-limited so commentary stays readable)
-    if (
-      this.prevOrderIds.length === orderIds.length &&
-      this.elapsedSeconds - this.lastOvertakeEventTime > 1.35 &&
-      leader.body.position.z > 8 &&
-      leader.body.position.z < this.config.trackLengthMeters - 3
-    ) {
-      for (let i = 1; i < ordered.length; i++) {
+    // Track every authentic active-field overtake + collision-linked rank shift
+    if (this.prevOrderIds.length === orderIds.length && leader.body.position.z > 4) {
+      let emittedCommentaryOvertake = false;
+      for (let i = 0; i < ordered.length; i++) {
         const racer = ordered[i];
         if (racer.finished) continue;
         const prevIdx = this.prevOrderIds.indexOf(racer.input.marble.id);
         if (prevIdx > i) {
-          const passedId = this.prevOrderIds[i];
-          if (passedId && passedId !== racer.input.marble.id) {
-            this.pushEvent({
-              type: 'OVERTAKE',
-              elapsedSeconds: this.elapsedSeconds,
-              distanceMeters: racer.body.position.z,
-              primaryMarbleId: racer.input.marble.id,
-              secondaryMarbleId: passedId,
-              position: i + 1,
-            });
-            this.lastOvertakeEventTime = this.elapsedSeconds;
-            break;
+          this.overtakeCount += prevIdx - i;
+          if (
+            this.elapsedSeconds - racer.lastContactTime <=
+            this.physicsConfig.telemetry.collisionRankWindowSeconds
+          ) {
+            this.collisionLinkedPositionChanges += 1;
+          }
+
+          if (
+            !emittedCommentaryOvertake &&
+            i > 0 &&
+            this.elapsedSeconds - this.lastOvertakeEventTime > 1.35 &&
+            leader.body.position.z > 8 &&
+            leader.body.position.z < this.config.trackLengthMeters - 3
+          ) {
+            const passedId = this.prevOrderIds[i];
+            if (passedId && passedId !== racer.input.marble.id) {
+              this.pushEvent({
+                type: 'OVERTAKE',
+                elapsedSeconds: this.elapsedSeconds,
+                distanceMeters: racer.body.position.z,
+                primaryMarbleId: racer.input.marble.id,
+                secondaryMarbleId: passedId,
+                position: i + 1,
+              });
+              this.lastOvertakeEventTime = this.elapsedSeconds;
+              emittedCommentaryOvertake = true;
+            }
           }
         }
       }
@@ -563,7 +816,7 @@ export class SprintSimulation {
   }
 
   private getOrderedRacers(): InternalRacer[] {
-    return [...this.racers].sort((a, b) => {
+    this._orderedScratch.sort((a, b) => {
       if (a.finished && b.finished) {
         return (a.finishTimeSeconds ?? 0) - (b.finishTimeSeconds ?? 0);
       }
@@ -573,6 +826,7 @@ export class SprintSimulation {
       if (Math.abs(zDiff) > 1e-5) return zDiff;
       return a.input.lane - b.input.lane;
     });
+    return this._orderedScratch;
   }
 
   public getEvents(): SimulationEvent[] {
@@ -589,6 +843,52 @@ export class SprintSimulation {
 
   public getElapsedSeconds(): number {
     return this.elapsedSeconds;
+  }
+
+  public getTelemetry(): SprintTelemetry {
+    const outerLimit = this.config.laneWidthMeters * 4 + 0.5;
+    let stuckCount = 0;
+    let escapedCount = 0;
+
+    for (const r of this.racers) {
+      if (!r.finished) {
+        stuckCount += 1;
+      }
+      if (
+        Math.abs(r.body.position.x) > outerLimit ||
+        r.body.position.y < -25 ||
+        r.body.position.y > 20
+      ) {
+        escapedCount += 1;
+      }
+    }
+
+    return {
+      marbleCollisions: this.marbleCollisions,
+      significantCollisions: this.significantCollisions,
+      avgCollisionImpactSpeed:
+        this.marbleCollisions > 0 ? this.impactSpeedSum / this.marbleCollisions : 0,
+      maxCollisionImpactSpeed: this.maxImpactSpeed,
+      wallContacts: this.wallContacts,
+      overtakes: this.overtakeCount,
+      leadChanges: this.leadChangeCount,
+      collisionLinkedPositionChanges: this.collisionLinkedPositionChanges,
+      closePackSeconds: (this.closePackTicks * this.physicsConfig.fixedDt) / 8,
+      stuckCount,
+      escapedCount,
+    };
+  }
+
+  public getAngularRollingCheck(): Array<{
+    marbleId: string;
+    linearZ: number;
+    spinXR: number;
+  }> {
+    return this.racers.map((r) => ({
+      marbleId: r.input.marble.id,
+      linearZ: r.body.velocity.z,
+      spinXR: r.body.angularVelocity.x * this.physicsConfig.marbleRadius,
+    }));
   }
 
   public getSnapshot(): SprintSimulationSnapshot {
