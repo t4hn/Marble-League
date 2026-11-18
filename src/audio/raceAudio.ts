@@ -35,7 +35,10 @@ export class RaceAudioEngine {
     return this.ctx;
   }
 
-  public playStartTone(isGo: boolean): void {
+  public playStartTone(
+    isGo: boolean,
+    stage?: 'ready' | '3' | '2' | '1' | 'go',
+  ): void {
     if (this.muted) return;
     const ctx = this.ensureContext();
     if (!ctx) return;
@@ -43,16 +46,37 @@ export class RaceAudioEngine {
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    osc.type = isGo ? 'triangle' : 'sine';
-    osc.frequency.setValueAtTime(isGo ? 880 : 440, now);
-    gain.gain.setValueAtTime(0.001, now);
-    gain.gain.exponentialRampToValueAtTime(isGo ? 0.14 : 0.09, now + 0.015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + (isGo ? 0.34 : 0.16));
+    const effectiveStage = stage ?? (isGo ? 'go' : '1');
+
+    if (effectiveStage === 'go' || isGo) {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.setValueAtTime(1046.5, now + 0.08);
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.15, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.36);
+    } else if (effectiveStage === 'ready') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(349.23, now);
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.065, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.19);
+    } else {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(effectiveStage === '1' ? 523.25 : 440, now);
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.095, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.17);
+    }
 
     osc.connect(gain);
     gain.connect(ctx.destination);
+    osc.onended = () => {
+      osc.disconnect();
+      gain.disconnect();
+    };
     osc.start(now);
-    osc.stop(now + (isGo ? 0.36 : 0.18));
+    osc.stop(now + (isGo || effectiveStage === 'go' ? 0.38 : 0.21));
   }
 
   public playFinishChime(position: number): void {

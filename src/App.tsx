@@ -6,13 +6,15 @@ import {
   loadLeagueState,
   renameMarbleDisplayName,
   renameTeamDisplayName,
-  resetLeagueState,
+  resetCurrentSeason,
+  updateTeamLogo,
 } from './engine/storage';
 import {HubSection, LeagueHubView} from './components/LeagueHubView';
 import {TeamsView} from './components/TeamsView';
 import {MarblesView} from './components/MarblesView';
 import {CalendarView} from './components/CalendarView';
 import {StandingsView} from './components/StandingsView';
+import {OptionsView} from './components/OptionsView';
 import {SprintBroadcastView} from './components/SprintBroadcastView';
 
 export default function App() {
@@ -53,11 +55,15 @@ export default function App() {
     setLeague((prev) => renameMarbleDisplayName(prev, marbleId, newName));
   }, []);
 
-  const handleResetLeague = React.useCallback(() => {
-    const fresh = resetLeagueState();
-    setLeague(fresh);
-    setSelectedTeamId(null);
-    setSelectedMarbleId(null);
+  const handleUpdateTeamLogo = React.useCallback(
+    (teamId: string, logoDataUrl: string | null) => {
+      setLeague((prev) => updateTeamLogo(prev, teamId, logoDataUrl));
+    },
+    [],
+  );
+
+  const handleResetCurrentSeason = React.useCallback(() => {
+    setLeague((prev) => resetCurrentSeason(prev));
   }, []);
 
   // Full-bleed 3D Sprint Broadcast mode
@@ -84,6 +90,7 @@ export default function App() {
     {id: 'marbles', label: 'Marbles'},
     {id: 'calendar', label: 'Calendar'},
     {id: 'standings', label: 'Standings'},
+    {id: 'options', label: 'Options'},
   ];
 
   return (
@@ -178,6 +185,7 @@ export default function App() {
               setSection('marbles');
             }}
             onRenameTeam={handleRenameTeam}
+            onUpdateTeamLogo={handleUpdateTeamLogo}
           />
         )}
 
@@ -194,7 +202,7 @@ export default function App() {
           <CalendarView
             league={league}
             onWatchRound={(rnd) => setActiveBroadcastRound(rnd)}
-            onResetSeason={handleResetLeague}
+            onOpenOptions={() => setSection('options')}
           />
         )}
 
@@ -205,6 +213,13 @@ export default function App() {
               setSelectedTeamId(teamId);
               setSection('teams');
             }}
+          />
+        )}
+
+        {section === 'options' && (
+          <OptionsView
+            league={league}
+            onResetCurrentSeason={handleResetCurrentSeason}
           />
         )}
       </main>

@@ -26,6 +26,11 @@ import {
 } from '../engine/sprintSimulation';
 import {scoreRaceEvent, selectTeamRepresentatives} from '../engine/scoring';
 import {buildCommentaryForEvent, CommentaryLine} from '../engine/commentary';
+import {
+  CountdownStageSpec,
+  DEFAULT_CAMERA_MODE,
+  SPRINT_COUNTDOWN_SCHEDULE,
+} from '../engine/broadcastConfig';
 import {CameraViewMode, SprintTrackScene} from '../render/SprintTrackScene';
 import {RaceAudioEngine} from '../audio/raceAudio';
 import {MarbleAvatar, TeamEmblem} from './MarbleAvatar';
@@ -60,9 +65,9 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
   const defaultSeed = round.result?.seed ?? league.leagueSeed + round.roundNumber * 137;
   const [raceSeed, setRaceSeed] = React.useState<number>(defaultSeed);
   const [phase, setPhase] = React.useState<RacePhase>('grid');
-  const [countdownLabel, setCountdownLabel] = React.useState<string>('');
+  const [countdownStage, setCountdownStage] = React.useState<CountdownStageSpec | null>(null);
   const [simSpeed, setSimSpeed] = React.useState<number>(1);
-  const [cameraMode, setCameraMode] = React.useState<CameraViewMode>('broadcast');
+  const [cameraMode, setCameraMode] = React.useState<CameraViewMode>(DEFAULT_CAMERA_MODE);
   const [muted, setMuted] = React.useState<boolean>(false);
   const [hudHidden, setHudHidden] = React.useState<boolean>(false);
   const [dockCollapsed, setDockCollapsed] = React.useState<boolean>(false);
@@ -86,11 +91,21 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
   const raceSeedRef = React.useRef<number>(raceSeed);
   const onCommitRef = React.useRef(onCommitResult);
   const committedThisRunRef = React.useRef<boolean>(false);
+  const countdownTimersRef = React.useRef<number[]>([]);
+  const countdownTokenRef = React.useRef<number>(0);
 
   phaseRef.current = phase;
   simSpeedRef.current = simSpeed;
   raceSeedRef.current = raceSeed;
   onCommitRef.current = onCommitResult;
+
+  const clearCountdownTimers = React.useCallback(() => {
+    countdownTokenRef.current += 1;
+    for (const timerId of countdownTimersRef.current) {
+      window.clearTimeout(timerId);
+    }
+    countdownTimersRef.current = [];
+  }, []);
 
   // Sync body state attribute for inspection/testability
   React.useEffect(() => {
@@ -109,7 +124,7 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
   const currSnapRef = React.useRef<ReturnType<SprintSimulation['getSnapshot']> | null>(null);
 
   const initializeSimulation = React.useCallback(
-    (seed: number) => {
+    (seed: number, resetToOverhead: boolean = false) => {
       const sim = new SprintSimulation(competitors, config, seed);
       simRef.current = sim;
       committedThisRunRef.current = false;
@@ -120,7 +135,14 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
       setElapsedSeconds(0);
       setCommentary([]);
       setOfficialResult(null);
-      sceneRef.current?.setGateLampState('ready');
+      setCountdownStage(null);
+      if (resetToOverhead) {
+        setCameraMode(DEFAULT_CAMERA_MODE);
+        sceneRef.current?.setCameraMode(DEFAULT_CAMERA_MODE, true);
+      } else {
+        sceneRef.current?.snapCamera();
+      }
+      sceneRef.current?.setGateLampState('idle');
       sceneRef.current?.syncFromSimulation(snap.racers, 0, 0.1);
       sceneRef.current?.renderFrame();
     },
@@ -137,7 +159,9 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
     const audio = new RaceAudioEngine();
     audioRef.current = audio;
 
-    initializeSimulation(raceSeedRef.current);
+    setCameraMode(DEFAULT_CAMERA_MODE);
+    scene.setCameraMode(DEFAULT_CAMERA_MODE, true);
+    initializeSimulation(raceSeedRef.current, true);
 
     let lastNow = performance.now();
     let accumulator = 0;
@@ -270,6 +294,7 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
 
     return () => {
       disposed = true;
+      clearCountdownTimers();
       audio.dispose();
       scene.dispose();
       sceneRef.current = null;
@@ -278,33 +303,59 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [venue.id, round.roundNumber]);
 
-  const startCountdownAndLaunch = React.useCallback(() => {
-    const activeEl = document.activeElement as HTMLElement | null;
-    activeEl?.blur();
+  const startCountdownAndLaunch = React.useCallback(
+    (options?: {forceRestart?: boolean; resetToOverhead?: boolean}) => {
+      const forceRestart = options?.forceRestart ?? false;
+      const resetToOverhead = options?.resetToOverhead ?? false;
 
-    initializeSimulation(raceSeedRef.current);
-    setPhase('countdown');
-    setCountdownLabel('SET');
-    sceneRef.current?.setGateLampState('countdown1');
-    audioRef.current?.playStartTone(false);
+      if (phaseRef.current === 'countdown' && !forceRestart) {
+        return;
+      }
 
-    window.setTimeout(() => {
-      if (phaseRef.current !== 'countdown') return;
-      setCountdownLabel('READY');
-      sceneRef.current?.setGateLampState('countdown2');
-      audioRef.current?.playStartTone(false);
-    }, 450);
+      const activeEl = document.activeElement as HTMLElement | null;
+      activeEl?.blur();
 
-    window.setTimeout(() => {
-      if (phaseRef.current !== 'countdown') return;
-      setCountdownLabel('GO');
-      sceneRef.current?.setGateLampState('go');
-      audioRef.current?.playStartTone(true);
-      simRef.current?.startRace();
-      setPhase('racing');
-      window.setTimeout(() => setCountdownLabel(''), 550);
-    }, 900);
-  }, [initializeSimulation]);
+      clearCountdownTimers();
+      const token = countdownTokenRef.current;
+
+      initializeSimulation(raceSeedRef.current, resetToOverhead);
+      phaseRef.current = 'countdown';
+      setPhase('countdown');
+
+      for (const stage of SPRINT_COUNTDOWN_SCHEDULE) {
+        if (stage.offsetMs === 0) {
+          setCountdownStage(stage);
+          sceneRef.current?.setGateLampState(stage.lampState);
+          audioRef.current?.playStartTone(stage.isGo, stage.id);
+          continue;
+        }
+
+        const timerId = window.setTimeout(() => {
+          if (countdownTokenRef.current !== token) return;
+          if (phaseRef.current !== 'countdown') return;
+
+          setCountdownStage(stage);
+          sceneRef.current?.setGateLampState(stage.lampState);
+          audioRef.current?.playStartTone(stage.isGo, stage.id);
+
+          if (stage.isGo) {
+            simRef.current?.startRace();
+            phaseRef.current = 'racing';
+            setPhase('racing');
+
+            const clearId = window.setTimeout(() => {
+              if (countdownTokenRef.current !== token) return;
+              setCountdownStage(null);
+            }, stage.durationMs);
+            countdownTimersRef.current.push(clearId);
+          }
+        }, stage.offsetMs);
+
+        countdownTimersRef.current.push(timerId);
+      }
+    },
+    [clearCountdownTimers, initializeSimulation],
+  );
 
   const handleTogglePause = React.useCallback(() => {
     setPhase((p) => {
@@ -315,8 +366,16 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
   }, []);
 
   const handleRerunSameSeed = React.useCallback(() => {
-    startCountdownAndLaunch();
+    startCountdownAndLaunch({forceRestart: true, resetToOverhead: true});
   }, [startCountdownAndLaunch]);
+
+  const handleExitBroadcast = React.useCallback(
+    (goToSection?: 'hub' | 'standings') => {
+      clearCountdownTimers();
+      onExit(goToSection);
+    },
+    [clearCountdownTimers, onExit],
+  );
 
   const handleCameraChange = (mode: CameraViewMode) => {
     setCameraMode(mode);
@@ -390,33 +449,40 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
                   </span>
                 </div>
                 <div className="space-y-1">
-                  {orderedLiveRacers.map((r) => (
-                    <div
-                      key={r.marbleId}
-                      className="flex items-center justify-between text-xs py-0.5"
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="w-4 font-mono tabular-nums text-slate-400">
-                          {r.liveRank}
-                        </span>
-                        <span
-                          className="w-2.5 h-2.5 rounded-full shrink-0"
-                          style={{backgroundColor: r.primaryColor}}
-                        />
-                        <span className="font-medium text-white truncate">{r.name}</span>
-                        <span className="font-mono text-[10px] text-slate-400">
-                          {r.shortCode}
+                  {orderedLiveRacers.map((r) => {
+                    const team = league.teams[r.teamId];
+                    return (
+                      <div
+                        key={r.marbleId}
+                        className="flex items-center justify-between text-xs py-0.5"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="w-4 font-mono tabular-nums text-slate-400">
+                            {r.liveRank}
+                          </span>
+                          {team ? (
+                            <TeamEmblem team={team} size={16} />
+                          ) : (
+                            <span
+                              className="w-2.5 h-2.5 rounded-full shrink-0"
+                              style={{backgroundColor: r.primaryColor}}
+                            />
+                          )}
+                          <span className="font-medium text-white truncate">{r.name}</span>
+                          <span className="font-mono text-[10px] text-slate-400">
+                            {r.shortCode}
+                          </span>
+                        </div>
+                        <span className="font-mono text-[11px] tabular-nums text-slate-300 shrink-0">
+                          {r.finished && r.finishTimeSeconds !== null
+                            ? `${r.finishTimeSeconds.toFixed(2)}s`
+                            : r.liveRank === 1
+                              ? `${Math.round(r.progressMeters)}m`
+                              : `+${r.gapToLeaderSeconds.toFixed(2)}s`}
                         </span>
                       </div>
-                      <span className="font-mono text-[11px] tabular-nums text-slate-300 shrink-0">
-                        {r.finished && r.finishTimeSeconds !== null
-                          ? `${r.finishTimeSeconds.toFixed(2)}s`
-                          : r.liveRank === 1
-                            ? `${Math.round(r.progressMeters)}m`
-                            : `+${r.gapToLeaderSeconds.toFixed(2)}s`}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
 
@@ -450,7 +516,7 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
               <div className="flex items-center gap-2 pointer-events-auto">
                 <button
                   type="button"
-                  onClick={() => onExit('hub')}
+                  onClick={() => handleExitBroadcast('hub')}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-white/15 text-xs font-semibold text-white hover:bg-white/10 transition-colors cursor-pointer"
                   style={{backgroundColor: 'rgba(11, 14, 20, 0.88)'}}
                 >
@@ -462,13 +528,57 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
           )}
 
           {/* Center Countdown Indicator */}
-          {countdownLabel && (
-            <div className="fixed inset-0 flex items-center justify-center pointer-events-none">
+          {countdownStage && (
+            <div
+              data-testid="countdown-overlay"
+              className="fixed inset-0 flex items-center justify-center pointer-events-none"
+            >
               <div
-                className="px-10 py-5 rounded-xl border border-white/20 font-display text-6xl font-extrabold tracking-wider text-[#e5a93c]"
-                style={{backgroundColor: 'rgba(11, 14, 20, 0.9)'}}
+                key={countdownStage.id}
+                className={`countdown-stage-enter flex flex-col items-center justify-center min-w-[200px] px-10 py-6 rounded-2xl border shadow-2xl ${
+                  countdownStage.isGo
+                    ? 'border-emerald-400/60'
+                    : 'border-[#e5a93c]/45'
+                }`}
+                style={{backgroundColor: 'rgba(11, 14, 20, 0.92)'}}
               >
-                {countdownLabel}
+                <div className="flex items-center gap-2 mb-2.5" aria-hidden="true">
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full transition-colors ${
+                      countdownStage.isGo ? 'bg-slate-700' : 'bg-red-500'
+                    }`}
+                  />
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full transition-colors ${
+                      !countdownStage.isGo && countdownStage.id !== 'ready'
+                        ? 'bg-[#e5a93c]'
+                        : 'bg-slate-700'
+                    }`}
+                  />
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full transition-colors ${
+                      countdownStage.isGo ? 'bg-emerald-400' : 'bg-slate-700'
+                    }`}
+                  />
+                </div>
+                <div
+                  className={`font-display font-extrabold tracking-wider leading-none ${
+                    countdownStage.isGo
+                      ? 'text-7xl text-emerald-400'
+                      : countdownStage.id === 'ready'
+                        ? 'text-5xl text-[#e5a93c]'
+                        : 'text-8xl text-[#e5a93c] tabular-nums'
+                  }`}
+                >
+                  {countdownStage.label}
+                </div>
+                <div className="mt-2 text-[11px] font-mono uppercase tracking-[0.2em] text-slate-400">
+                  {countdownStage.isGo
+                    ? 'Gate Released'
+                    : countdownStage.id === 'ready'
+                      ? 'Hold On Grid'
+                      : 'Launch Sequence'}
+                </div>
               </div>
             </div>
           )}
@@ -530,8 +640,9 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
                 >
                   <button
                     type="button"
+                    disabled={phase === 'countdown'}
                     onClick={handleTogglePause}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#e5a93c] text-[#0b0e14] text-xs font-semibold hover:bg-[#f0b954] cursor-pointer whitespace-nowrap"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#e5a93c] text-[#0b0e14] text-xs font-semibold hover:bg-[#f0b954] disabled:opacity-45 disabled:pointer-events-none cursor-pointer whitespace-nowrap"
                   >
                     {phase === 'paused' ? (
                       <>
@@ -567,8 +678,8 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
                     <Camera className="w-3.5 h-3.5 text-slate-400 mr-1 hidden sm:inline" />
                     {(
                       [
-                        ['broadcast', 'Follow'],
                         ['overhead', 'Overhead'],
+                        ['broadcast', 'Follow'],
                         ['finish', 'Finish'],
                         ['gate', 'Gate'],
                       ] as const
@@ -641,11 +752,24 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
                   value={raceSeed}
                   onChange={(e) => {
                     const next = Number(e.target.value) || 1;
+                    clearCountdownTimers();
                     setRaceSeed(next);
-                    initializeSimulation(next);
+                    initializeSimulation(next, true);
                   }}
                   className="w-24 px-2.5 py-1.5 rounded bg-[#121722] border border-white/20 text-xs font-mono tabular-nums text-white"
                 />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = ((raceSeed * 1664525 + 1013904223) >>> 0) % 900000 + 100000;
+                    clearCountdownTimers();
+                    setRaceSeed(next);
+                    initializeSimulation(next, true);
+                  }}
+                  className="px-2.5 py-1.5 rounded bg-white/10 hover:bg-white/15 text-xs font-medium text-slate-200 cursor-pointer whitespace-nowrap"
+                >
+                  New Seed
+                </button>
               </div>
             </div>
 
@@ -686,7 +810,7 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => onExit('hub')}
+                  onClick={() => handleExitBroadcast('hub')}
                   className="px-4 py-2.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white cursor-pointer"
                 >
                   Back to Hub
@@ -694,7 +818,7 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
                 <button
                   type="button"
                   data-start="true"
-                  onClick={startCountdownAndLaunch}
+                  onClick={() => startCountdownAndLaunch()}
                   className="inline-flex items-center gap-2 px-6 py-2.5 rounded-lg bg-[#e5a93c] text-[#0b0e14] text-sm font-bold hover:bg-[#f0b954] cursor-pointer"
                 >
                   <Play className="w-4 h-4 fill-current" />
@@ -796,14 +920,14 @@ export const SprintBroadcastView: React.FC<SprintBroadcastViewProps> = ({
               <div className="flex items-center gap-2.5">
                 <button
                   type="button"
-                  onClick={() => onExit('standings')}
+                  onClick={() => handleExitBroadcast('standings')}
                   className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold text-white cursor-pointer"
                 >
                   Championship Standings
                 </button>
                 <button
                   type="button"
-                  onClick={() => onExit('hub')}
+                  onClick={() => handleExitBroadcast('hub')}
                   className="px-5 py-2 rounded-lg bg-[#e5a93c] text-[#0b0e14] text-xs font-bold hover:bg-[#f0b954] cursor-pointer"
                 >
                   Return to League Hub

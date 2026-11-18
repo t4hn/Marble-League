@@ -43,6 +43,32 @@ All four physical attributes (`52–92` balanced range) influence Sprint outcome
 
 ---
 
+## Admin Controls & Broadcast Polish (Phase 3)
+
+### 1. Options & Administrative Current-Season Reset
+- Added **Options** (`src/components/OptionsView.tsx`) to primary navigation with:
+  - **General**: Application overview, current season number, live league status, roster count, and archived season count.
+  - **Administration**: **`RESET CURRENT SEASON`** control protected by a clear confirmation dialog.
+- `resetCurrentSeason()` (`src/engine/storage.ts`) resets the active season calendar back to Round 1 (`scheduled`, results cleared) and updates `localStorage` immediately while preserving the season number, all 8 teams, 32 marbles, custom display names, custom team logos, physical attributes, career statistics, venue records, and completed historical season archives.
+
+### 2. Team Logo Customisation (`TeamsView.tsx` & `src/utils/logoImage.ts`)
+- Each team profile includes **Edit Logo** supporting **PNG, JPG, and WEBP** uploads with live preview before saving, **Save Logo**, **Cancel**, and **Restore Default Logo**.
+- Uploaded images are normalised client-side into lightweight square `160×160` transparent assets using aspect-preserving `contain` scaling (never distorted) and stored under permanent team IDs (`team.logoDataUrl`) so logos persist across reloads and appear consistently across Team Profiles, League Hub, Standings, Calendar results, Live Leaderboards, and Official Classifications.
+
+### 3. Default Overhead Camera & Broadcast Camera Modes (`src/engine/broadcastConfig.ts`, `SprintTrackScene.ts`)
+- Every Sprint broadcast (including initial load, Replay Seed, and New Seed) opens in the **Overhead** camera (`DEFAULT_CAMERA_MODE = 'overhead'`).
+- Four smooth, wall-clock damped camera modes remain available at all race speeds with track-deck clearance clamping:
+  - **Overhead** *(default)*: Dynamic pack-centered high-angle framing that expands cleanly as the pack stretches.
+  - **Follow**: High 3/4 crane angle tracking the leading pack anchor without snapping backward as early finishers cross the line.
+  - **Finish**: Reverse photo-finish angle looking cleanly through the checkered arch toward incoming contenders.
+  - **Gate**: Prominent starting-grid composition framing all 8 lanes, the starting gate bar, and the 3-stage light pod.
+
+### 4. Deliberate ~5-Second Starting Countdown (`SPRINT_COUNTDOWN_SCHEDULE`)
+- Races open with a managed timer sequence (`READY` `1.5s` → `3` `1.0s` → `2` `1.0s` → `1` `1.0s` → `GO` at `4.5s` with distinct audio tone and emerald emphasis).
+- Physics simulation remains paused and the starting gate stays physically closed until `GO`, with automatic timer cleanup on exit, replay, or seed change.
+
+---
+
 ## Commands & Verification
 
 ```bash

@@ -56,6 +56,24 @@ interface TeamEmblemProps {
 }
 
 export const TeamEmblem: React.FC<TeamEmblemProps> = ({team, size = 28}) => {
+  if (team.logoDataUrl) {
+    return (
+      <span
+        className="inline-flex items-center justify-center rounded-md border border-white/15 bg-[#0b0e14] overflow-hidden shrink-0"
+        style={{
+          width: size,
+          height: size,
+        }}
+      >
+        <img
+          src={team.logoDataUrl}
+          alt={`${team.name} logo`}
+          className="w-full h-full object-contain p-0.5"
+        />
+      </span>
+    );
+  }
+
   const paths: Record<Team['emblemType'], React.ReactNode> = {
     viper: <path d="M12 3L20 9L16 21L12 17L8 21L4 9L12 3Z" fill="currentColor" />,
     meteor: <path d="M19 4L9 14L5 14L4 20L10 19L10 15L20 5L19 4Z" fill="currentColor" />,

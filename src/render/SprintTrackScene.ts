@@ -17,7 +17,15 @@ import {
   createTrackSurfaceTexture,
 } from './textures';
 
-export type CameraViewMode = 'broadcast' | 'overhead' | 'finish' | 'gate';
+import {
+  CameraViewMode,
+  clampCameraAboveTrack,
+  computeBroadcastCameraPose,
+  computePackCameraMetrics,
+  DEFAULT_CAMERA_MODE,
+} from '../engine/broadcastConfig';
+
+export type {CameraViewMode};
 
 interface MarbleRig {
   marbleId: string;
@@ -31,7 +39,6 @@ interface MarbleRig {
 // Pre-allocated scratch objects to guarantee zero GC allocations in render loop
 const _camTargetPos = new THREE.Vector3();
 const _camLookTarget = new THREE.Vector3();
-const _curLookTarget = new THREE.Vector3(0, 1, 10);
 const _quatScratch = new THREE.Quaternion();
 const _prevQuatScratch = new THREE.Quaternion();
 const _dummyMat = new THREE.Matrix4();
@@ -68,7 +75,10 @@ export class SprintTrackScene {
   private gateBarGroup!: THREE.Group;
   private gateLamps: THREE.Mesh[] = [];
   private keyLight!: THREE.DirectionalLight;
-  private cameraMode: CameraViewMode = 'broadcast';
+  private cameraMode: CameraViewMode = DEFAULT_CAMERA_MODE;
+  private readonly curLookTarget = new THREE.Vector3(0, 1, 6);
+  private readonly zPositionsScratch: number[] = [];
+  private snapNextCameraUpdate = true;
   private gateClosedY = 0;
 
   private frameId = 0;
@@ -114,10 +124,16 @@ export class SprintTrackScene {
     this.scene.background = new THREE.Color(horizonHex);
     this.scene.fog = new THREE.FogExp2(horizonHex, isTwilight ? 0.0085 : 0.0068);
 
-    this.camera = new THREE.PerspectiveCamera(48, width / height, 0.2, 320);
-    this.camera.position.set(6.5, 4.8, -5.5);
-    _curLookTarget.set(0, getSprintTrackSurfaceY(6, this.config), 6);
-    this.camera.lookAt(_curLookTarget);
+    this.camera = new THREE.PerspectiveCamera(46, width / height, 0.2, 320);
+    const initialMetrics = computePackCameraMetrics([-0.3], this.config.trackLengthMeters);
+    const initialPose = computeBroadcastCameraPose(
+      this.cameraMode,
+      initialMetrics,
+      this.config,
+    );
+    this.camera.position.set(initialPose.posX, initialPose.posY, initialPose.posZ);
+    this.curLookTarget.set(initialPose.lookX, initialPose.lookY, initialPose.lookZ);
+    this.camera.lookAt(this.curLookTarget);
 
     // Mandatory RoomEnvironment PMREM studio reflections on every device
     const pmrem = new THREE.PMREMGenerator(this.renderer);
@@ -614,25 +630,40 @@ export class SprintTrackScene {
     }
   }
 
-  public setCameraMode(mode: CameraViewMode): void {
+  public setCameraMode(mode: CameraViewMode, immediate: boolean = false): void {
     this.cameraMode = mode;
+    if (immediate) {
+      this.snapNextCameraUpdate = true;
+    }
   }
 
-  public setGateLampState(phase: 'ready' | 'countdown1' | 'countdown2' | 'go'): void {
+  public snapCamera(): void {
+    this.snapNextCameraUpdate = true;
+  }
+
+  public setGateLampState(
+    phase: 'idle' | 'ready' | '3' | '2' | '1' | 'go' | 'countdown1' | 'countdown2',
+  ): void {
     this.gateLamps.forEach((lamp, idx) => {
       const mat = lamp.material as THREE.MeshStandardMaterial;
-      if (phase === 'ready') {
+      if (phase === 'idle') {
         mat.emissive.setHex(idx === 0 ? 0xef4444 : 0x000000);
-        mat.emissiveIntensity = idx === 0 ? 1.8 : 0;
-      } else if (phase === 'countdown1') {
-        mat.emissive.setHex(idx <= 1 ? 0xf59e0b : 0x000000);
-        mat.emissiveIntensity = idx <= 1 ? 1.8 : 0;
-      } else if (phase === 'countdown2') {
-        mat.emissive.setHex(idx <= 1 ? 0xf59e0b : 0x000000);
-        mat.emissiveIntensity = idx <= 1 ? 2.4 : 0;
+        mat.emissiveIntensity = idx === 0 ? 0.9 : 0;
+      } else if (phase === 'ready') {
+        mat.emissive.setHex(idx === 0 ? 0xef4444 : 0x000000);
+        mat.emissiveIntensity = idx === 0 ? 2.0 : 0;
+      } else if (phase === '3' || phase === 'countdown1') {
+        mat.emissive.setHex(idx === 0 ? 0xef4444 : idx === 1 ? 0xf59e0b : 0x000000);
+        mat.emissiveIntensity = idx === 0 ? 2.0 : idx === 1 ? 1.3 : 0;
+      } else if (phase === '2' || phase === 'countdown2') {
+        mat.emissive.setHex(idx === 0 ? 0xef4444 : idx === 1 ? 0xf59e0b : 0x000000);
+        mat.emissiveIntensity = idx === 0 ? 2.2 : idx === 1 ? 2.1 : 0;
+      } else if (phase === '1') {
+        mat.emissive.setHex(idx === 0 ? 0xef4444 : idx === 1 ? 0xf59e0b : 0x000000);
+        mat.emissiveIntensity = idx <= 1 ? 2.7 : 0;
       } else {
         mat.emissive.setHex(idx === 2 ? 0x10b981 : 0x000000);
-        mat.emissiveIntensity = idx === 2 ? 2.6 : 0;
+        mat.emissiveIntensity = idx === 2 ? 2.8 : 0;
       }
     });
   }
@@ -648,9 +679,7 @@ export class SprintTrackScene {
     this.gateBarGroup.position.y = this.gateClosedY + gateOpenProgress * 1.45;
 
     const clampedAlpha = Math.max(0, Math.min(1, alpha));
-    let leaderZ = 0;
-    let packSumZ = 0;
-    let activeCount = 0;
+    this.zPositionsScratch.length = 0;
 
     for (let i = 0; i < racers.length; i++) {
       const r = racers[i];
@@ -687,66 +716,48 @@ export class SprintTrackScene {
 
       const floorY = getSprintTrackSurfaceY(pz, this.config);
       rig.shadowDisc.position.set(px, floorY + 0.015, pz);
-
-      if (!r.finished && pz > leaderZ) {
-        leaderZ = pz;
-      }
-      if (pz <= this.config.trackLengthMeters + 4) {
-        packSumZ += pz;
-        activeCount++;
-      }
+      this.zPositionsScratch.push(pz);
     }
 
-    const focusZ =
-      leaderZ > 0
-        ? leaderZ
-        : activeCount > 0
-          ? packSumZ / activeCount
-          : this.config.trackLengthMeters;
-
+    const packMetrics = computePackCameraMetrics(
+      this.zPositionsScratch,
+      this.config.trackLengthMeters,
+    );
+    const focusZ = Math.min(this.config.trackLengthMeters + 1.5, packMetrics.maxZ);
     const focusY = getSprintTrackSurfaceY(focusZ, this.config);
 
-    // Move keyLight shadow frustum along track with leader for razor-sharp marble shadows
+    // Move keyLight shadow frustum along track with leading pack for crisp marble shadows
     if (this.keyLight && !this.isSoftwareGl) {
       this.keyLight.position.set(16, focusY + 24, focusZ - 6);
       this.keyLight.target.position.set(0, focusY, focusZ + 4);
     }
 
-    // Compute camera preset target
-    switch (this.cameraMode) {
-      case 'broadcast': {
-        const clampedZ = Math.min(this.config.trackLengthMeters + 2, focusZ);
-        const yTrack = getSprintTrackSurfaceY(clampedZ, this.config);
-        _camTargetPos.set(6.4, yTrack + 4.4, clampedZ - 7.5);
-        _camLookTarget.set(0, yTrack + 0.3, clampedZ + 5.5);
-        break;
-      }
-      case 'overhead': {
-        const midZ = activeCount > 0 ? packSumZ / activeCount : this.config.trackLengthMeters * 0.5;
-        const yTrack = getSprintTrackSurfaceY(midZ, this.config);
-        _camTargetPos.set(0, yTrack + 13.5, midZ - 4.0);
-        _camLookTarget.set(0, yTrack, midZ + 4.0);
-        break;
-      }
-      case 'finish': {
-        const fz = this.config.trackLengthMeters;
-        const fy = getSprintTrackSurfaceY(fz, this.config);
-        _camTargetPos.set(4.8, fy + 2.8, fz + 8.5);
-        _camLookTarget.set(0, fy + 0.6, fz - 12);
-        break;
-      }
-      case 'gate': {
-        const gy = getSprintTrackSurfaceY(0, this.config);
-        _camTargetPos.set(-4.6, gy + 2.5, 4.8);
-        _camLookTarget.set(0, gy + 0.5, -0.2);
-        break;
-      }
+    const pose = computeBroadcastCameraPose(this.cameraMode, packMetrics, this.config);
+    _camTargetPos.set(pose.posX, pose.posY, pose.posZ);
+    _camLookTarget.set(pose.lookX, pose.lookY, pose.lookZ);
+
+    if (this.snapNextCameraUpdate) {
+      this.snapNextCameraUpdate = false;
+      this.camera.position.copy(_camTargetPos);
+      this.curLookTarget.copy(_camLookTarget);
+    } else {
+      // Frame-rate and sim-speed independent exponential damping
+      const camDt = Math.min(0.1, Math.max(0.001, dt));
+      const posAlpha = 1 - Math.exp(-4.8 * camDt);
+      const lookAlpha = 1 - Math.exp(-6.2 * camDt);
+      this.camera.position.lerp(_camTargetPos, posAlpha);
+      this.curLookTarget.lerp(_camLookTarget, lookAlpha);
     }
 
-    const dampAlpha = this.isSoftwareGl ? 0.35 : 1 - Math.exp(-5.5 * Math.max(0.001, dt));
-    this.camera.position.lerp(_camTargetPos, dampAlpha);
-    _curLookTarget.lerp(_camLookTarget, dampAlpha);
-    this.camera.lookAt(_curLookTarget);
+    // Prevent mid-transition arcs from clipping through track deck or rails
+    this.camera.position.y = clampCameraAboveTrack(
+      this.camera.position.x,
+      this.camera.position.y,
+      this.camera.position.z,
+      this.config,
+    );
+
+    this.camera.lookAt(this.curLookTarget);
   }
 
   public renderFrame(): void {

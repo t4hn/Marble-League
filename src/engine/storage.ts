@@ -58,6 +58,48 @@ export function resetLeagueState(seed: number = DEFAULT_LEAGUE_SEED): LeagueStat
 }
 
 /**
+ * Resets only the active season's calendar back to Round 1 (all rounds scheduled,
+ * current-season results and standings cleared) while preserving:
+ * - Current season number
+ * - All 8 teams, custom display names, custom logos, and career team stats
+ * - All 32 marbles, custom display names, fixed attributes, and career marble stats
+ * - Venues, track records, historical event IDs, and notable incidents
+ * - Completed historical season archives
+ */
+export function resetCurrentSeason(prevState: LeagueState): LeagueState {
+  const next: LeagueState = JSON.parse(JSON.stringify(prevState)) as LeagueState;
+  next.calendar = createSeasonCalendar();
+  saveLeagueState(next);
+  return next;
+}
+
+export function updateTeamLogo(
+  prevState: LeagueState,
+  teamId: string,
+  logoDataUrl: string | null,
+): LeagueState {
+  const existingTeam = prevState.teams[teamId];
+  if (!existingTeam) return prevState;
+
+  const updatedTeam = {...existingTeam};
+  if (logoDataUrl && logoDataUrl.trim().length > 0) {
+    updatedTeam.logoDataUrl = logoDataUrl;
+  } else {
+    delete updatedTeam.logoDataUrl;
+  }
+
+  const next: LeagueState = {
+    ...prevState,
+    teams: {
+      ...prevState.teams,
+      [teamId]: updatedTeam,
+    },
+  };
+  saveLeagueState(next);
+  return next;
+}
+
+/**
  * Commits an officially completed race result into the LeagueState:
  * - Stores result on the matching calendar round
  * - Updates team career statistics
@@ -191,7 +233,14 @@ export function commitRaceResultToLeague(
       rounds: next.calendar,
       completedAtIso: new Date().toISOString(),
     };
-    next.seasonHistory.push(archive);
+    const existingIdx = next.seasonHistory.findIndex(
+      (a) => a.seasonNumber === next.currentSeasonNumber,
+    );
+    if (existingIdx >= 0) {
+      next.seasonHistory[existingIdx] = archive;
+    } else {
+      next.seasonHistory.push(archive);
+    }
   }
 
   saveLeagueState(next);

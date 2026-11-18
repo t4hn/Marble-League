@@ -4,7 +4,7 @@ import {CalendarRound, LeagueState} from '../types/league';
 import {calculateSeasonStandings, selectTeamRepresentatives} from '../engine/scoring';
 import {MarbleAvatar, TeamEmblem} from './MarbleAvatar';
 
-export type HubSection = 'hub' | 'teams' | 'marbles' | 'calendar' | 'standings';
+export type HubSection = 'hub' | 'teams' | 'marbles' | 'calendar' | 'standings' | 'options';
 
 interface LeagueHubViewProps {
   league: LeagueState;
@@ -331,12 +331,17 @@ export const LeagueHubView: React.FC<LeagueHubViewProps> = ({
         {league.seasonHistory.length > 0 && (
           <div className="mt-5 pt-4 border-t border-white/10 flex items-center gap-3 text-xs text-slate-400">
             <Trophy className="w-4 h-4 text-[#e5a93c]" />
-            <span>
-              Archived Seasons: {league.seasonHistory.length} · Latest Champion:{' '}
-              <strong className="text-white">
-                {league.teams[league.seasonHistory[league.seasonHistory.length - 1].championTeamId]?.name}
-              </strong>
-            </span>
+            {(() => {
+              const latest = league.seasonHistory[league.seasonHistory.length - 1];
+              const champ = league.teams[latest.championTeamId];
+              return (
+                <span className="inline-flex items-center gap-2">
+                  <span>Archived Seasons: {league.seasonHistory.length} · Latest Champion:</span>
+                  {champ && <TeamEmblem team={champ} size={18} />}
+                  <strong className="text-white">{champ?.name}</strong>
+                </span>
+              );
+            })()}
           </div>
         )}
       </section>

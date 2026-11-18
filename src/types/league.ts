@@ -73,6 +73,7 @@ export interface Team {
     | 'turtle'
     | 'grizzly'
     | 'antics';
+  logoDataUrl?: string;
   marbleIds: string[];
   stats: TeamStats;
 }

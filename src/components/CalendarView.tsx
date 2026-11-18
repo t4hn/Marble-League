@@ -1,18 +1,18 @@
 import React from 'react';
-import {Play, CheckCircle2, Clock, RotateCcw} from 'lucide-react';
+import {Play, CheckCircle2, Clock, Settings} from 'lucide-react';
 import {CalendarRound, LeagueState} from '../types/league';
 import {TeamEmblem} from './MarbleAvatar';
 
 interface CalendarViewProps {
   league: LeagueState;
   onWatchRound: (roundNumber: number) => void;
-  onResetSeason: () => void;
+  onOpenOptions: () => void;
 }
 
 export const CalendarView: React.FC<CalendarViewProps> = ({
   league,
   onWatchRound,
-  onResetSeason,
+  onOpenOptions,
 }) => {
   const [expandedRound, setExpandedRound] = React.useState<number | null>(null);
 
@@ -84,11 +84,11 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
 
         <button
           type="button"
-          onClick={onResetSeason}
+          onClick={onOpenOptions}
           className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white/8 hover:bg-white/15 text-xs font-medium text-slate-200 transition-colors cursor-pointer whitespace-nowrap"
         >
-          <RotateCcw className="w-3.5 h-3.5" />
-          Reset Inaugural League
+          <Settings className="w-3.5 h-3.5" />
+          Season Options
         </button>
       </div>
 
@@ -177,7 +177,12 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                             <td className="py-2 px-3 text-white font-medium">
                               {marble?.name ?? mr.marbleId}
                             </td>
-                            <td className="py-2 px-3 text-slate-300">{team?.name ?? mr.teamId}</td>
+                            <td className="py-2 px-3 text-slate-300">
+                              <div className="flex items-center gap-2">
+                                {team && <TeamEmblem team={team} size={18} />}
+                                <span>{team?.name ?? mr.teamId}</span>
+                              </div>
+                            </td>
                             <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-400">
                               {mr.lane}
                             </td>
