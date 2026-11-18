@@ -1,0 +1,6 @@
+{
+  "name": "Marble League",
+  "description": "Spectator-first 3D physics marble racing league simulation with persistent teams, rosters, calendar, and championship standings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
